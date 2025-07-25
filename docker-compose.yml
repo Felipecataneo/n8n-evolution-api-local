@@ -1,0 +1,420 @@
+volumes:
+  n8n_storage:
+  postgres_storage:
+  ollama_storage:
+  qdrant_storage:
+  evolution_instances:
+  evolution_redis:
+
+networks:
+  demo:
+
+x-n8n: &service-n8n
+  image: n8nio/n8n:latest
+  networks: ['demo']
+  environment:
+    - DB_TYPE=postgresdb
+    - DB_POSTGRESDB_HOST=postgres
+    - DB_POSTGRESDB_USER=${POSTGRES_USER}
+    - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+    - N8N_DIAGNOSTICS_ENABLED=false
+    - N8N_PERSONALIZATION_ENABLED=false
+    - N8N_ENCRYPTION_KEY
+    - N8N_USER_MANAGEMENT_JWT_SECRET
+    - OLLAMA_HOST=${OLLAMA_HOST:-ollama:11434}
+  env_file:
+    - path: .env
+      required: true
+
+x-ollama: &service-ollama
+  image: ollama/ollama:latest
+  container_name: ollama
+  networks: ['demo']
+  restart: unless-stopped
+  ports:
+    - 11434:11434
+  volumes:
+    - ollama_storage:/root/.ollama
+
+x-init-ollama: &init-ollama
+  image: ollama/ollama:latest
+  networks: ['demo']
+  container_name: ollama-pull-llama
+  volumes:
+    - ollama_storage:/root/.ollama
+  entrypoint: /bin/sh
+  environment:
+    - OLLAMA_HOST=ollama:11434
+  command:
+    - "-c"
+    - "sleep 3; ollama pull nomic-embed-text" # escolha o modelo do n8n
+    
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    networks: ['demo']
+    restart: unless-stopped
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB
+      # Configuração para múltiplos databases
+      - POSTGRES_MULTIPLE_DATABASES=n8n,evolution
+    volumes:
+      - postgres_storage:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  n8n-import:
+    <<: *service-n8n
+    hostname: n8n-import
+    container_name: n8n-import
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - "n8n import:credentials --separate --input=/demo-data/credentials && n8n import:workflow --separate --input=/demo-data/workflows"
+    volumes:
+      - ./n8n/demo-data:/demo-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  n8n:
+    <<: *service-n8n
+    hostname: n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - 5678:5678
+    volumes:
+      - n8n_storage:/home/node/.n8n
+      - ./n8n/demo-data:/demo-data
+      - ./shared:/data/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n-import:
+        condition: service_completed_successfully
+    environment:
+      - WEBHOOK_URL=http://n8n:5678/
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    networks: ['demo']
+    restart: unless-stopped
+    command: >
+      redis-server --port 6379 --appendonly yes
+    volumes:
+      - evolution_redis:/data
+    ports:
+      - 6379:6379
+
+  evolution-api:
+    image: evoapicloud/evolution-api:latest
+    container_name: evolution_api
+    networks: ['demo']
+    restart: unless-stopped
+    ports:
+      - 9090:9090
+    volumes:
+      - evolution_instances:/evolution/instances
+    environment:
+      # Server Configuration
+      - SERVER_TYPE=http
+      - SERVER_PORT=9090
+      - SERVER_URL=http://localhost:9090
+      
+      # SSL Configuration (disabled for HTTP)
+      # - SSL_CONF_PRIVKEY=/path/to/cert.key
+      # - SSL_CONF_FULLCHAIN=/path/to/cert.crt
+      
+      # Sentry (optional)
+      - SENTRY_DSN=
+      
+      # CORS Configuration
+      - CORS_ORIGIN=*
+      - CORS_METHODS=GET,POST,PUT,DELETE
+      - CORS_CREDENTIALS=true
+      
+      # Logging Configuration
+      - LOG_LEVEL=ERROR,WARN,DEBUG,INFO,LOG,VERBOSE,DARK,WEBHOOKS,WEBSOCKET
+      - LOG_COLOR=true
+      - LOG_BAILEYS=error
+      
+      # Event Emitter
+      - EVENT_EMITTER_MAX_LISTENERS=50
+      
+      # Instance Management
+      - DEL_INSTANCE=false
+      
+      # Database Configuration
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://root:1002@postgres:5432/evolution?schema=public
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_exchange
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
+      - DATABASE_SAVE_MESSAGE_UPDATE=true
+      - DATABASE_SAVE_DATA_CONTACTS=true
+      - DATABASE_SAVE_DATA_CHATS=true
+      - DATABASE_SAVE_DATA_LABELS=true
+      - DATABASE_SAVE_DATA_HISTORIC=true
+      - DATABASE_SAVE_IS_ON_WHATSAPP=true
+      - DATABASE_SAVE_IS_ON_WHATSAPP_DAYS=7
+      - DATABASE_DELETE_MESSAGE=true
+      
+      # RabbitMQ Configuration
+      - RABBITMQ_ENABLED=false
+      - RABBITMQ_URI=amqp://localhost
+      - RABBITMQ_EXCHANGE_NAME=evolution
+      - RABBITMQ_FRAME_MAX=8192
+      - RABBITMQ_GLOBAL_ENABLED=false
+      - RABBITMQ_PREFIX_KEY=evolution
+      - RABBITMQ_EVENTS_APPLICATION_STARTUP=false
+      - RABBITMQ_EVENTS_INSTANCE_CREATE=false
+      - RABBITMQ_EVENTS_INSTANCE_DELETE=false
+      - RABBITMQ_EVENTS_QRCODE_UPDATED=false
+      - RABBITMQ_EVENTS_MESSAGES_SET=false
+      - RABBITMQ_EVENTS_MESSAGES_UPSERT=false
+      - RABBITMQ_EVENTS_MESSAGES_EDITED=false
+      - RABBITMQ_EVENTS_MESSAGES_UPDATE=false
+      - RABBITMQ_EVENTS_MESSAGES_DELETE=false
+      - RABBITMQ_EVENTS_SEND_MESSAGE=false
+      - RABBITMQ_EVENTS_SEND_MESSAGE_UPDATE=false
+      - RABBITMQ_EVENTS_CONTACTS_SET=false
+      - RABBITMQ_EVENTS_CONTACTS_UPSERT=false
+      - RABBITMQ_EVENTS_CONTACTS_UPDATE=false
+      - RABBITMQ_EVENTS_PRESENCE_UPDATE=false
+      - RABBITMQ_EVENTS_CHATS_SET=false
+      - RABBITMQ_EVENTS_CHATS_UPSERT=false
+      - RABBITMQ_EVENTS_CHATS_UPDATE=false
+      - RABBITMQ_EVENTS_CHATS_DELETE=false
+      - RABBITMQ_EVENTS_GROUPS_UPSERT=false
+      - RABBITMQ_EVENTS_GROUP_UPDATE=false
+      - RABBITMQ_EVENTS_GROUP_PARTICIPANTS_UPDATE=false
+      - RABBITMQ_EVENTS_CONNECTION_UPDATE=false
+      - RABBITMQ_EVENTS_REMOVE_INSTANCE=false
+      - RABBITMQ_EVENTS_LOGOUT_INSTANCE=false
+      - RABBITMQ_EVENTS_CALL=false
+      - RABBITMQ_EVENTS_TYPEBOT_START=false
+      - RABBITMQ_EVENTS_TYPEBOT_CHANGE_STATUS=false
+      
+      # SQS Configuration
+      - SQS_ENABLED=false
+      - SQS_ACCESS_KEY_ID=
+      - SQS_SECRET_ACCESS_KEY=
+      - SQS_ACCOUNT_ID=
+      - SQS_REGION=
+      
+      # WebSocket Configuration
+      - WEBSOCKET_ENABLED=false
+      - WEBSOCKET_GLOBAL_EVENTS=false
+      
+      # Pusher Configuration
+      - PUSHER_ENABLED=false
+      - PUSHER_GLOBAL_ENABLED=false
+      - PUSHER_GLOBAL_APP_ID=
+      - PUSHER_GLOBAL_KEY=
+      - PUSHER_GLOBAL_SECRET=
+      - PUSHER_GLOBAL_CLUSTER=
+      - PUSHER_GLOBAL_USE_TLS=true
+      - PUSHER_EVENTS_APPLICATION_STARTUP=true
+      - PUSHER_EVENTS_QRCODE_UPDATED=true
+      - PUSHER_EVENTS_MESSAGES_SET=true
+      - PUSHER_EVENTS_MESSAGES_UPSERT=true
+      - PUSHER_EVENTS_MESSAGES_EDITED=true
+      - PUSHER_EVENTS_MESSAGES_UPDATE=true
+      - PUSHER_EVENTS_MESSAGES_DELETE=true
+      - PUSHER_EVENTS_SEND_MESSAGE=true
+      - PUSHER_EVENTS_SEND_MESSAGE_UPDATE=true
+      - PUSHER_EVENTS_CONTACTS_SET=true
+      - PUSHER_EVENTS_CONTACTS_UPSERT=true
+      - PUSHER_EVENTS_CONTACTS_UPDATE=true
+      - PUSHER_EVENTS_PRESENCE_UPDATE=true
+      - PUSHER_EVENTS_CHATS_SET=true
+      - PUSHER_EVENTS_CHATS_UPSERT=true
+      - PUSHER_EVENTS_CHATS_UPDATE=true
+      - PUSHER_EVENTS_CHATS_DELETE=true
+      - PUSHER_EVENTS_GROUPS_UPSERT=true
+      - PUSHER_EVENTS_GROUPS_UPDATE=true
+      - PUSHER_EVENTS_GROUP_PARTICIPANTS_UPDATE=true
+      - PUSHER_EVENTS_CONNECTION_UPDATE=true
+      - PUSHER_EVENTS_LABELS_EDIT=true
+      - PUSHER_EVENTS_LABELS_ASSOCIATION=true
+      - PUSHER_EVENTS_CALL=true
+      - PUSHER_EVENTS_TYPEBOT_START=false
+      - PUSHER_EVENTS_TYPEBOT_CHANGE_STATUS=false
+      
+      # WhatsApp Business API Configuration
+      - WA_BUSINESS_TOKEN_WEBHOOK=evolution
+      - WA_BUSINESS_URL=https://graph.facebook.com
+      - WA_BUSINESS_VERSION=v20.0
+      - WA_BUSINESS_LANGUAGE=en_US
+      
+      # Global Webhook Configuration
+      - WEBHOOK_GLOBAL_ENABLED=true
+      - WEBHOOK_GLOBAL_URL=http://n8n:5678/webhook/evolution-webhook
+      - WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS=true
+      - WEBHOOK_EVENTS_APPLICATION_STARTUP=false
+      - WEBHOOK_EVENTS_QRCODE_UPDATED=true
+      - WEBHOOK_EVENTS_MESSAGES_SET=true
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - WEBHOOK_EVENTS_MESSAGES_EDITED=true
+      - WEBHOOK_EVENTS_MESSAGES_UPDATE=true
+      - WEBHOOK_EVENTS_MESSAGES_DELETE=true
+      - WEBHOOK_EVENTS_SEND_MESSAGE=true
+      - WEBHOOK_EVENTS_SEND_MESSAGE_UPDATE=true
+      - WEBHOOK_EVENTS_CONTACTS_SET=true
+      - WEBHOOK_EVENTS_CONTACTS_UPSERT=true
+      - WEBHOOK_EVENTS_CONTACTS_UPDATE=true
+      - WEBHOOK_EVENTS_PRESENCE_UPDATE=true
+      - WEBHOOK_EVENTS_CHATS_SET=true
+      - WEBHOOK_EVENTS_CHATS_UPSERT=true
+      - WEBHOOK_EVENTS_CHATS_UPDATE=true
+      - WEBHOOK_EVENTS_CHATS_DELETE=true
+      - WEBHOOK_EVENTS_GROUPS_UPSERT=true
+      - WEBHOOK_EVENTS_GROUPS_UPDATE=true
+      - WEBHOOK_EVENTS_GROUP_PARTICIPANTS_UPDATE=true
+      - WEBHOOK_EVENTS_CONNECTION_UPDATE=true
+      - WEBHOOK_EVENTS_REMOVE_INSTANCE=false
+      - WEBHOOK_EVENTS_LOGOUT_INSTANCE=false
+      - WEBHOOK_EVENTS_LABELS_EDIT=true
+      - WEBHOOK_EVENTS_LABELS_ASSOCIATION=true
+      - WEBHOOK_EVENTS_CALL=true
+      - WEBHOOK_EVENTS_TYPEBOT_START=false
+      - WEBHOOK_EVENTS_TYPEBOT_CHANGE_STATUS=false
+      - WEBHOOK_EVENTS_ERRORS=true
+      - WEBHOOK_EVENTS_ERRORS_WEBHOOK=http://n8n:5678/webhook/evolution-errors
+      - WEBHOOK_REQUEST_TIMEOUT_MS=60000
+      - WEBHOOK_RETRY_MAX_ATTEMPTS=10
+      - WEBHOOK_RETRY_INITIAL_DELAY_SECONDS=5
+      - WEBHOOK_RETRY_USE_EXPONENTIAL_BACKOFF=true
+      - WEBHOOK_RETRY_MAX_DELAY_SECONDS=300
+      - WEBHOOK_RETRY_JITTER_FACTOR=0.2
+      - WEBHOOK_RETRY_NON_RETRYABLE_STATUS_CODES=400,401,403,404,422
+      
+      # Session Configuration
+      - CONFIG_SESSION_PHONE_CLIENT=Evolution API
+      - CONFIG_SESSION_PHONE_NAME=Chrome
+      
+      # QR Code Configuration
+      - QRCODE_LIMIT=30
+      - QRCODE_COLOR=#175197
+      
+      # Integration Services
+      - TYPEBOT_ENABLED=false
+      - TYPEBOT_API_VERSION=latest
+      - CHATWOOT_ENABLED=false
+      - CHATWOOT_MESSAGE_READ=true
+      - CHATWOOT_MESSAGE_DELETE=true
+      - CHATWOOT_BOT_CONTACT=true
+      - CHATWOOT_IMPORT_DATABASE_CONNECTION_URI=postgresql://user:passwprd@host:5432/chatwoot?sslmode=disable
+      - CHATWOOT_IMPORT_PLACEHOLDER_MEDIA_MESSAGE=true
+      - OPENAI_ENABLED=false
+      - DIFY_ENABLED=false
+      - N8N_ENABLED=true
+      - EVOAI_ENABLED=false
+      
+      # Cache Configuration
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://redis:6379/6
+      - CACHE_REDIS_TTL=604800
+      - CACHE_REDIS_PREFIX_KEY=evolution
+      - CACHE_REDIS_SAVE_INSTANCES=false
+      - CACHE_LOCAL_ENABLED=false
+      
+      # Amazon S3 Configuration
+      - S3_ENABLED=false
+      - S3_ACCESS_KEY=
+      - S3_SECRET_KEY=
+      - S3_BUCKET=evolution
+      - S3_PORT=443
+      - S3_ENDPOINT=s3.domain.com
+      - S3_REGION=eu-west-3
+      - S3_USE_SSL=true
+      
+      # Audio Converter (optional)
+      # - API_AUDIO_CONVERTER=http://localhost:4040/process-audio
+      # - API_AUDIO_CONVERTER_KEY=429683C4C977415CAAFCCE10F7D57E11
+      
+      # Authentication
+      - AUTHENTICATION_API_KEY=api key do evolution # altere aqui ou até mesmo leve para o .env
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+      - LANGUAGE=pt-br
+      
+      # Proxy Configuration (optional)
+      # - PROXY_HOST=
+      # - PROXY_PORT=80
+      # - PROXY_PROTOCOL=http
+      # - PROXY_USERNAME=
+      # - PROXY_PASSWORD=
+      
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      n8n:  # Adicionar dependência do n8n
+        condition: service_started
+
+  qdrant:
+    image: qdrant/qdrant
+    hostname: qdrant
+    container_name: qdrant
+    networks: ['demo']
+    restart: unless-stopped
+    ports:
+      - 6333:6333
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  ollama-cpu:
+    profiles: ["cpu"]
+    <<: *service-ollama
+
+  ollama-gpu:
+    profiles: ["gpu-nvidia"]
+    <<: *service-ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  ollama-gpu-amd:
+    profiles: ["gpu-amd"]
+    <<: *service-ollama
+    image: ollama/ollama:rocm
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"
+
+  ollama-pull-llama-cpu:
+    profiles: ["cpu"]
+    <<: *init-ollama
+    depends_on:
+      - ollama-cpu
+
+  ollama-pull-llama-gpu:
+    profiles: ["gpu-nvidia"]
+    <<: *init-ollama
+    depends_on:
+      - ollama-gpu
+
+  ollama-pull-llama-gpu-amd:
+    profiles: [gpu-amd]
+    <<: *init-ollama
+    image: ollama/ollama:rocm
+    depends_on:
+     - ollama-gpu-amd
